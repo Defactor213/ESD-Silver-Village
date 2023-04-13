@@ -1,0 +1,637 @@
+version: '3.7'
+
+services:
+  #######################################
+  # API Gateway
+  #######################################
+  kong:
+    image: kong:2.7
+    restart: always
+    networks:
+      - 'kong-net'
+      - 'zipkin-net'
+      - 'auth-net'
+      - 'bookings-net'
+      - 'movies-net'
+      - 'payments-net'
+      - 'showtime-net'
+      - 'rating-net'
+      - 'trailer-net'
+    environment:
+      KONG_DATABASE: 'postgres'
+      KONG_PG_HOST: 'kong-database'
+      KONG_PG_USER: 'kong'
+      KONG_PG_PASSWORD: 'password'
+      KONG_PROXY_LISTEN: '0.0.0.0:8000'
+      KONG_ADMIN_LISTEN: '0.0.0.0:8001'
+    depends_on:
+      - 'kong-database'
+      - 'kong-migration'
+    ports:
+      - '8000:8000'
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "sh",
+          "-c",
+          "curl -I -s -L http://127.0.0.1:8000 || exit 1"
+        ]
+      interval: '10s'
+      timeout: '5s'
+      retries: 5
+
+  #######################################
+  # Short-lived, bootstraps API Gateway
+  #######################################
+  kong-migration:
+    image: kong:2.7
+    command: 'kong migrations bootstrap'
+    restart: 'on-failure'
+    networks:
+      - 'kong-net'
+    environment:
+      KONG_DATABASE: 'postgres'
+      KONG_PG_HOST: 'kong-database'
+      KONG_PG_USER: 'kong'
+      KONG_PG_PASSWORD: 'password'
+    depends_on:
+      - 'kong-database'
+
+  #######################################
+  # Database for API Gateway
+  #######################################
+  kong-database:
+    image: postgres:9.6
+    restart: always
+    networks:
+      - 'kong-net'
+    environment:
+      POSTGRES_DB: 'kong'
+      POSTGRES_USER: 'kong'
+      POSTGRES_PASSWORD: 'password'
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "kong" ]
+      interval: '10s'
+      timeout: '5s'
+      retries: 5
+    volumes:
+      - './volumes/kong-pgdata:/var/lib/postgresql/data'
+
+  #######################################
+  # Kong decK short-lived service
+  #######################################
+  kong-deck:
+    build:
+      context: './services/kong-deck'
+      dockerfile: Dockerfile
+    restart: 'on-failure'
+    networks:
+      - 'kong-net'
+    environment:
+      DECK_KONG_ADDR: 'http://kong:8001'
+      DECK_ZIPKIN_HOST: 'zipkin'
+    depends_on:
+      - 'kong'
+    volumes:
+      - './services/kong-deck/kong.yaml:/app/kong.yaml:ro'
+
+  #######################################
+  # Konga configuration UI for Kong
+  #######################################
+  konga:
+    image: pantsel/konga
+    platform: linux/amd64
+    restart: always
+    networks:
+      - 'kong-net'
+    environment:
+      DB_ADAPTER: 'postgres'
+      DB_HOST: 'kong-database'
+      DB_USER: 'kong'
+      DB_PASSWORD: 'password'
+      DB_DATABASE: 'konga_db'
+      KONGA_SEED_USER_DATA_SOURCE_FILE: '/run/secrets/konga_user_seed'
+      KONGA_SEED_KONG_NODE_DATA_SOURCE_FILE: '/run/secrets/konga_node_seed'
+    depends_on:
+      - 'kong'
+    ports:
+      - '1337:1337'
+    volumes:
+      - 'kongadata:/app/kongadata'
+      - './services/konga/userSeed.js:/run/secrets/konga_user_seed:ro'
+      - './services/konga/nodeSeed.js:/run/secrets/konga_node_seed:ro'
+    profiles:
+      - 'debug'
+
+  #######################################
+  # Database Management
+  #######################################
+  sqlpad:
+    image: sqlpad/sqlpad:5
+    networks:
+      - 'auth-net'
+    ports:
+      - '9000:3000'
+    environment:
+      SQLPAD_ADMIN: 'admin@example.com'
+      SQLPAD_ADMIN_PASSWORD: 'adminadmin'
+      SQLPAD_CONNECTIONS__auth__name: 'auth'
+      SQLPAD_CONNECTIONS__auth__driver: 'postgres'
+      SQLPAD_CONNECTIONS__auth__host: 'auth-database'
+      SQLPAD_CONNECTIONS__auth__username: 'auth'
+      SQLPAD_CONNECTIONS__auth__password: 'auth'
+      SQLPAD_CONNECTIONS__auth__database: 'auth'
+    profiles:
+      - 'debug'
+
+  #######################################
+  # RabbitMQ AMQP Message Broker
+  #######################################
+  rabbitmq:
+    image: rabbitmq:3.9-management
+    restart: always
+    networks:
+      - 'rabbitmq-net'
+    environment:
+      RABBITMQ_DEFAULT_USER: 'admin'
+      RABBITMQ_DEFAULT_PASS: 'adminadmin'
+    ports:
+      - '5672:5672'
+      - '15672:15672'
+
+  #######################################
+  # Auth service
+  #######################################
+  auth:
+    build:
+      dockerfile: Dockerfile
+      context: './services/auth'
+    restart: always
+    networks:
+      - 'auth-net'
+      - 'rabbitmq-net'
+    env_file: .env
+    environment:
+      PORT: '8080'
+      DATABASE_URL: 'postgres://auth:auth@auth-database:5432/auth?sslmode=disable'
+      KONG_ADDR: 'http://kong:8001'
+      RABBITMQ_URL: 'amqp://admin:adminadmin@rabbitmq:5672'
+    volumes:
+      - './services/auth:/app'
+    depends_on:
+      - 'auth-database'
+      - 'rabbitmq'
+
+  #######################################
+  # PostgreSQL database for Auth service
+  #######################################
+  auth-database:
+    image: postgres:14-bullseye
+    networks:
+      - 'auth-net'
+    restart: always
+    environment:
+      POSTGRES_USER: 'auth'
+      POSTGRES_PASSWORD: 'auth'
+      POSTGRES_DB: 'auth'
+    volumes:
+      - './volumes/auth-pgdata:/var/lib/postgresql/data'
+      - './services/auth/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d'
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "auth" ]
+      interval: '10s'
+      timeout: '5s'
+      retries: 5
+
+  #######################################
+  # Zipkin Tracing service
+  #######################################
+  zipkin:
+    image: openzipkin/zipkin:2.23
+    networks:
+      - 'zipkin-net'
+      - 'rabbitmq-net'
+    restart: always
+    environment:
+      RABBIT_URI: 'amqp://admin:adminadmin@rabbitmq:5672'
+      RABBIT_USER: 'admin'
+      RABBIT_PASSWORD: 'adminadmin'
+    ports:
+      - '9411:9411'
+    depends_on:
+      - 'rabbitmq'
+
+  #######################################
+  # Notifications service
+  #######################################
+  notifications:
+    build:
+      dockerfile: Dockerfile
+      context: './services/notifications'
+    restart: always
+    networks:
+      - 'rabbitmq-net'
+    env_file: .env
+    environment:
+      RABBITMQ_URL: 'amqp://admin:adminadmin@rabbitmq:5672?connection_attempts=5&retry_delay=5'
+    depends_on:
+      - rabbitmq
+
+  #######################################
+  # Frontend service
+  #######################################
+  frontend:
+    build:
+      dockerfile: Dockerfile
+      context: './services/frontend'
+    environment:
+      WATCHPACK_POLLING: 'true'
+    restart: always
+    networks:
+      - 'frontend-net'
+      - 'kong-net'
+    volumes:
+      - './services/frontend:/app'
+      - '/app/node_modules'
+    ports:
+      - '3000:3000'
+
+  #######################################
+  # Bookings service
+  #######################################
+  bookings:
+    build:
+      dockerfile: Dockerfile
+      context: './services/bookings'
+    restart: always
+    environment:
+      DATABASE_URL: 'mysql+mysqlconnector://bookings:bookings@bookings-database:3306/bookings'
+      RABBITMQ_URL: 'amqp://admin:adminadmin@rabbitmq:5672?connection_attempts=5&retry_delay=5'
+    networks:
+      - 'bookings-net'
+      - 'rabbitmq-net'
+    volumes:
+      - './services/bookings:/app'
+    depends_on:
+      - 'bookings-database'
+      - 'rabbitmq'
+
+  #######################################
+  # MySQL database for Bookings service
+  #######################################
+  bookings-database:
+    image: mysql/mysql-server:8.0
+    networks:
+      - 'bookings-net'
+    command: 'mysqld --default-authentication-plugin=mysql_native_password'
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: 'mysql'
+      MYSQL_ROOT_HOST: '%'
+      MYSQL_USER: 'bookings'
+      MYSQL_PASSWORD: 'bookings'
+      MYSQL_DATABASE: 'bookings'
+    volumes:
+      - './volumes/bookings-database:/var/lib/mysql'
+      - './services/bookings/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d'
+    ports:
+      - '3306:3306'
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "bookings" ]
+      interval: '10s'
+      timeout: '5s'
+      retries: 5
+
+  #######################################
+  # Movies service
+  #######################################
+  movies:
+    build:
+      dockerfile: Dockerfile
+      context: './services/movies'
+    restart: always
+    environment:
+      DATABASE_URL: 'mysql+mysqlconnector://movie:movie@movies-database:3306/movie'
+      RABBITMQ_URL: 'amqp://admin:adminadmin@rabbitmq:5672?connection_attempts=5&retry_delay=5'
+    networks:
+      - 'movies-net'
+      - 'rabbitmq-net'
+    volumes:
+      - './services/movies:/app'
+    depends_on:
+      - 'movies-database'
+      - 'rabbitmq'
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 26677
+        hard: 46677
+
+  #######################################
+  # PostgreSQL database for Movies service
+  #######################################
+  movies-database:
+    image: mysql/mysql-server:8.0
+    networks:
+      - 'movies-net'
+    command: 'mysqld --default-authentication-plugin=mysql_native_password'
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: 'mysql'
+      MYSQL_ROOT_HOST: '%'
+      MYSQL_USER: 'movie'
+      MYSQL_PASSWORD: 'movie'
+      MYSQL_DATABASE: 'movie'
+    volumes:
+      - './volumes/movies-database:/var/lib/mysql:rw,delegated'
+      - './services/movies/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d'
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "movies" ]
+      interval: '10s'
+      timeout: '5s'
+      retries: 5
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 26677
+        hard: 46677
+
+  #######################################
+  # Payments service
+  #######################################
+  payments:
+    build:
+      dockerfile: Dockerfile
+      context: './services/payments'
+    restart: always
+    environment:
+      DATABASE_URL: 'postgresql://payments:payments@payments-database:5432/payments?sslmode=disable'
+      RABBITMQ_URL: 'amqp://admin:adminadmin@rabbitmq:5672?connection_attempts=5&retry_delay=5'
+    env_file: .env
+    networks:
+      - 'payments-net'
+      - 'rabbitmq-net'
+    volumes:
+      - './services/payments:/app'
+    depends_on:
+      - 'payments-database'
+      - 'rabbitmq'
+
+  #######################################
+  # PostgreSQL database for Payments service
+  #######################################
+  payments-database:
+    image: postgres:14-bullseye
+    networks:
+      - 'payments-net'
+    restart: always
+    environment:
+      POSTGRES_USER: 'payments'
+      POSTGRES_PASSWORD: 'payments'
+      POSTGRES_DB: 'payments'
+    volumes:
+      - './volumes/payments-database:/var/lib/postgresql/data'
+      - './services/payments/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d'
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "payments" ]
+      interval: '10s'
+      timeout: '5s'
+      retries: 5
+
+  #######################################
+  # Showtime service
+  #######################################
+  showtime:
+    build:
+      dockerfile: Dockerfile
+      context: './services/showtime'
+    restart: always
+    environment:
+      DATABASE_URL: 'postgres://showtime:showtime@showtime-database:5432/showtime'
+      RABBITMQ_URL: 'amqp://admin:adminadmin@rabbitmq:5672?connection_attempts=5&retry_delay=5'
+    networks:
+      - 'showtime-net'
+      - 'rabbitmq-net'
+    volumes:
+      - './services/showtime:/app'
+    depends_on:
+      - 'showtime-database'
+      - 'rabbitmq'
+
+  #######################################
+  # MySQL database for showtime service
+  #######################################
+  showtime-database:
+    image: postgres:14-bullseye
+    networks:
+      - 'showtime-net'
+    restart: always
+    environment:
+      POSTGRES_USER: 'showtime'
+      POSTGRES_PASSWORD: 'showtime'
+      POSTGRES_DB: 'showtime'
+    volumes:
+      - './volumes/showtime-database:/var/lib/postgresql/data'
+      - './services/showtime/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d'
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "showtime" ]
+      interval: '10s'
+      timeout: '5s'
+      retries: 5
+
+  #######################################
+  # Rating service
+  #######################################
+  rating:
+    build:
+      dockerfile: Dockerfile
+      context: './services/rating'
+    restart: always
+    environment:
+      RABBITMQ_URL: 'amqp://admin:adminadmin@rabbitmq:5672?connection_attempts=5&retry_delay=5'
+      REDIS_URL: 'redis://rating-redis:6379'
+    env_file: .env
+    networks:
+      - 'rating-net'
+      - 'rabbitmq-net'
+    volumes:
+      - './services/rating:/app'
+    depends_on:
+      - 'rabbitmq'
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 26677
+        hard: 46677
+
+  #######################################
+  # Rating Redis
+  #######################################
+  rating-redis:
+    image: redis:6.0-bullseye
+    networks:
+      - 'rating-net'
+    volumes:
+      - './volumes/rating-redis:/data'
+
+  #######################################
+  # Trailer service
+  #######################################
+  trailer:
+    build:
+      dockerfile: Dockerfile
+      context: './services/trailer'
+    restart: always
+    environment:
+      RABBITMQ_URL: 'amqp://admin:adminadmin@rabbitmq:5672?connection_attempts=5&retry_delay=5'
+      REDIS_URL: 'redis://trailer-redis:6379'
+    env_file: .env
+    networks:
+      - 'trailer-net'
+      - 'rabbitmq-net'
+    volumes:
+      - './services/trailer:/app'
+    depends_on:
+      - 'rabbitmq'
+
+  #######################################
+  # Trailer Redis
+  #######################################
+  trailer-redis:
+    image: redis:6.0-bullseye
+    networks:
+      - 'trailer-net'
+    volumes:
+      - './volumes/trailer-redis:/data'
+
+  #######################################
+  # Add a Showtime orchestrator
+  #######################################
+  add-a-showtime:
+    build:
+      dockerfile: Dockerfile
+      context: './orchestrators/add-a-showtime'
+    restart: always
+    environment:
+      RABBITMQ_URL: 'amqp://admin:adminadmin@rabbitmq:5672?connection_attempts=5&retry_delay=5'
+    networks:
+      - 'movies-net'
+      - 'showtime-net'
+      - 'rabbitmq-net'
+    volumes:
+      - './orchestrators/add-a-showtime:/app'
+    depends_on:
+      - 'rabbitmq'
+      - 'movies'
+      - 'showtime'
+
+  #######################################
+  # List All Movies orchestrator
+  #######################################
+  list-all-movies:
+    build:
+      dockerfile: Dockerfile
+      context: './orchestrators/list-all-movies'
+    restart: always
+    environment:
+      RABBITMQ_URL: 'amqp://admin:adminadmin@rabbitmq:5672?connection_attempts=5&retry_delay=5'
+    networks:
+      - 'movies-net'
+      - 'rating-net'
+      - 'rabbitmq-net'
+    volumes:
+      - './orchestrators/list-all-movies:/app'
+    depends_on:
+      - 'rabbitmq'
+      - 'movies'
+      - 'rating'
+
+  #######################################
+  # Movie Details orchestrator
+  #######################################
+  movie-details:
+    build:
+      dockerfile: Dockerfile
+      context: './orchestrators/movie-details'
+    restart: always
+    environment:
+      RABBITMQ_URL: 'amqp://admin:adminadmin@rabbitmq:5672?connection_attempts=5&retry_delay=5'
+    networks:
+      - 'movies-net'
+      - 'rating-net'
+      - 'showtime-net'
+      - 'trailer-net'
+      - 'rabbitmq-net'
+    volumes:
+      - './orchestrators/movie-details:/app'
+    depends_on:
+      - 'rabbitmq'
+      - 'movies'
+      - 'rating'
+      - 'showtime'
+      - 'trailer'
+
+  #######################################
+  # Place a Booking orchestrator
+  #######################################
+  place-a-booking:
+    build:
+      dockerfile: Dockerfile
+      context: './orchestrators/place-a-booking'
+    restart: always
+    environment:
+      RABBITMQ_URL: 'amqp://admin:adminadmin@rabbitmq:5672?connection_attempts=5&retry_delay=5'
+      REDIS_URL: 'redis://place-a-booking-redis:6379'
+    networks:
+      - 'bookings-net'
+      - 'payments-net'
+      - 'rabbitmq-net'
+      - 'place-a-booking-net'
+      - 'auth-net'
+      - 'movies-net'
+      - 'showtime-net'
+    volumes:
+      - './orchestrators/place-a-booking:/app'
+    depends_on:
+      - 'rabbitmq'
+      - 'bookings'
+      - 'payments'
+  #######################################
+  # Place-a-booking Redis
+  #######################################
+  place-a-booking-redis:
+    image: redis:6.0-bullseye
+    networks:
+      - 'place-a-booking-net'
+    volumes:
+      - './volumes/place-a-booking-redis:/data'
+
+volumes:
+  kongadata:
+
+networks:
+  kong-net:
+    driver: bridge
+  zipkin-net:
+    driver: bridge
+  rabbitmq-net:
+    driver: bridge
+  auth-net:
+    driver: bridge
+  frontend-net:
+    driver: bridge
+  bookings-net:
+    driver: bridge
+  movies-net:
+    driver: bridge
+  payments-net:
+    driver: bridge
+  showtime-net:
+    driver: bridge
+  rating-net:
+    driver: bridge
+  trailer-net:
+    driver: bridge
+  place-a-booking-net:
+    driver: bridge

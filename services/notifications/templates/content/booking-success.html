@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome</title>
+</head>
+<body>
+    <p>Hi {{ display_name }},</p>
+    <p>This email is confirmation of your new booking for <b>{{ movie_title }}</b>.</p>
+
+    <table border="1">
+        <thead>
+            <th>Screening</th>
+            <th>Seat No</th>
+        </thead>
+        <tbody>
+            <tr>
+                <td>{{ movie_showtime }}</td>
+                <td>{{ movie_seat }}</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p>We look forward to seeing you there!</p>
+
+    <p>Regards,</p>
+    <p>Silver Village</p>
+</body>
+</html>
